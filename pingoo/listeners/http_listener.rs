@@ -249,17 +249,22 @@ pub(super) async fn serve_http_requests<IO: hyper::rt::Read + hyper::rt::Write +
             rules_ctx.add_variable_from_value("lists", &*lists);
 
             for rule in rules.as_ref() {
-                if rule.match_request(&rules_ctx) {
-                    for action in &rule.actions {
-                        match action {
-                            Action::Block {} => return Ok(new_blocked_response()),
-                            Action::Captcha {} => {
-                                if !captcha_verified {
-                                    return Ok(captcha_manager.serve_captcha());
+                match rule.match_request(&rules_ctx) {
+                    rules::RuleMatch::Match => {
+                        for action in &rule.actions {
+                            match action {
+                                Action::Block {} => return Ok(new_blocked_response()),
+                                Action::Captcha {} => {
+                                    if !captcha_verified {
+                                        return Ok(captcha_manager.serve_captcha());
+                                    }
                                 }
                             }
                         }
                     }
+                    // fail closed: block the request when a rule can't be evaluated
+                    rules::RuleMatch::Undetermined => return Ok(new_blocked_response()),
+                    rules::RuleMatch::NoMatch => {}
                 }
             }
 
