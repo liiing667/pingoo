@@ -1,7 +1,6 @@
 use std::{
-    fs::Metadata,
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, UNIX_EPOCH},
 };
@@ -35,6 +34,9 @@ pub struct StaticSiteService {
     name: Arc<String>,
     route: Option<rules::CompiledExpression>,
     config: StaticSiteServiceConfig,
+    /// canonicalized (symlinks and dot segments resolved) version of `config.root`.
+    /// All served files must live under this directory.
+    canonical_root: PathBuf,
     /// in-memory cache for popular files
     cache: Cache<PathBuf, Arc<CachedFile>>,
 }
@@ -56,10 +58,16 @@ impl StaticSiteService {
             // Time to live (TTL): 1 hour
             .time_to_idle(Duration::from_secs(3600))
             .build();
+        let static_config = config.r#static.unwrap();
+        let canonical_root = std::fs::canonicalize(&static_config.root).unwrap_or_else(|err| {
+            warn!("error canonicalizing static site root {:?}: {err}", static_config.root);
+            static_config.root.clone()
+        });
         return StaticSiteService {
-            config: config.r#static.unwrap(),
+            config: static_config,
             route: config.route,
             name: Arc::new(config.name),
+            canonical_root,
             cache,
         };
     }
@@ -87,40 +95,20 @@ impl HttpService for StaticSiteService {
             return new_method_not_allowed_error();
         }
 
-        // prevent directory traversal and other similar attacks
-        if url_path.contains("/..") || url_path.contains("../") || url_path.contains("//") {
-            debug!("error getting {url_path:?}: path is not valid");
+        // resolve the requested path to a canonical file path, guaranteed to live
+        // under the configured root directory. Anything else (dot segments, backslashes,
+        // percent-encoded traversal, symlinks escaping the root...) is rejected.
+        let Some(file_path) = resolve_path(&self.canonical_root, &self.config.root, url_path).await else {
+            debug!("error getting {url_path:?}: path is not valid or not found");
             return new_not_found_error();
-        }
-
-        let mut file_path = PathBuf::from(&self.config.root);
-        file_path.push(url_path);
+        };
 
         let file_metadata = match fs::metadata(&file_path).await {
             Ok(metadata) if metadata.is_dir() => {
-                // if it's a directory, we try the directory/index.html file
-                file_path.push("index.html");
-                match try_metadata(&file_path).await {
-                    Ok(metadata) => metadata,
-                    Err(res) => return res,
-                }
+                debug!("error getting {file_path:?}: is a directory");
+                return new_not_found_error();
             }
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if file_path.extension().is_some() {
-                    debug!("error getting {file_path:?}: not found");
-                    return new_not_found_error();
-                }
-
-                // prettify URLs
-                // if the path has not extension and was not found, we try path + ".html"
-                // e.g. /page -> /page.html
-                file_path.set_extension("html");
-                match try_metadata(&file_path).await {
-                    Ok(metadata) => metadata,
-                    Err(res) => return res,
-                }
-            }
             Err(err) => {
                 error!("error getting metadata for static file: {file_path:?}: {err}");
                 return new_internal_error_response_500();
@@ -257,20 +245,214 @@ impl HttpService for StaticSiteService {
     }
 }
 
-async fn try_metadata(path: &PathBuf) -> Result<Metadata, Response<BoxBody<Bytes, hyper::Error>>> {
-    match fs::metadata(&path).await {
-        Ok(metadata) if metadata.is_dir() => {
-            debug!("error getting {path:?}: is a directory");
-            Err(new_not_found_error())
+/// Percent-decode a URL path and convert it to a relative filesystem path.
+///
+/// Returns `None` for anything that could escape or confuse the filesystem
+/// resolution: invalid percent-encoding, NUL bytes, backslashes (path
+/// separators on some platforms) and `.` / `..` segments.
+fn sanitize_url_path(url_path: &str) -> Option<PathBuf> {
+    // reject malformed percent-encoded sequences: every '%' must be
+    // followed by exactly two hexadecimal digits
+    let bytes = url_path.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return None;
+            }
+            index += 3;
+        } else {
+            index += 1;
         }
-        Ok(metadata) => Ok(metadata),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            debug!("error getting {path:?}: not found");
-            Err(new_not_found_error())
+    }
+
+    let decoded = percent_encoding::percent_decode_str(url_path).decode_utf8().ok()?;
+    if decoded.contains(['\\', '\0']) {
+        return None;
+    }
+
+    let mut relative_path = PathBuf::new();
+    for segment in decoded.split('/') {
+        match segment {
+            // skip empty segments (e.g. from "//") and current-directory segments
+            "" | "." => {}
+            // never allow parent-directory segments, even if they would stay
+            // inside the root: reject them uniformly
+            ".." => return None,
+            segment => relative_path.push(segment),
         }
-        Err(err) => {
-            error!("error getting metadata for static file: {path:?}: {err}");
-            Err(new_internal_error_response_500())
+    }
+    Some(relative_path)
+}
+
+/// Canonicalize `candidate` (resolving symlinks and dot segments) and return it
+/// only if the resulting path stays within `canonical_root`.
+async fn canonicalize_within_root(canonical_root: &Path, candidate: &Path) -> Option<PathBuf> {
+    let canonical_path = fs::canonicalize(candidate).await.ok()?;
+    if canonical_path.starts_with(canonical_root) {
+        Some(canonical_path)
+    } else {
+        None
+    }
+}
+
+/// Resolve a request URL path to an existing file inside `canonical_root`.
+///
+/// Directories resolve to their `index.html` file, and extension-less paths
+/// fall back to `path.html` to prettify URLs. Returns `None` if the path is
+/// invalid, escapes the root, or doesn't match any file.
+async fn resolve_path(canonical_root: &Path, root: &Path, url_path: &str) -> Option<PathBuf> {
+    let relative_path = sanitize_url_path(url_path)?;
+    let candidate = root.join(&relative_path);
+
+    if let Some(canonical_path) = canonicalize_within_root(canonical_root, &candidate).await {
+        let metadata = fs::metadata(&canonical_path).await.ok()?;
+        if metadata.is_dir() {
+            // if it's a directory, we try the directory/index.html file
+            return canonicalize_within_root(canonical_root, &canonical_path.join("index.html")).await;
         }
+        return Some(canonical_path);
+    }
+
+    // prettify URLs
+    // if the path has no extension and was not found, we try path + ".html"
+    // e.g. /page -> /page.html
+    if candidate.extension().is_none() {
+        let candidate_with_extension = candidate.with_extension("html");
+        return canonicalize_within_root(canonical_root, &candidate_with_extension).await;
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// Create a temporary directory structure for path resolution tests:
+    /// ```text
+    /// base/
+    /// ├── secret.txt              <- outside of the served root
+    /// └── www/                    <- served root
+    ///     ├── index.html
+    ///     ├── page.html
+    ///     ├── sub/
+    ///     │   ├── index.html
+    ///     │   └── file.txt
+    ///     ├── link_inside         -> sub/file.txt
+    ///     └── link_outside        -> ../secret.txt
+    /// ```
+    struct TestSite {
+        base: PathBuf,
+        root: PathBuf,
+        canonical_root: PathBuf,
+    }
+
+    impl TestSite {
+        fn new() -> TestSite {
+            let unique = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let base = std::env::temp_dir().join(format!("pingoo-static-site-test-{}-{unique}", std::process::id()));
+            let root = base.join("www");
+            let sub = root.join("sub");
+            std::fs::create_dir_all(&sub).expect("error creating test directories");
+
+            std::fs::write(base.join("secret.txt"), "secret").expect("error writing test file");
+            std::fs::write(root.join("index.html"), "index").expect("error writing test file");
+            std::fs::write(root.join("page.html"), "page").expect("error writing test file");
+            std::fs::write(sub.join("index.html"), "sub index").expect("error writing test file");
+            std::fs::write(sub.join("file.txt"), "file").expect("error writing test file");
+            std::os::unix::fs::symlink("sub/file.txt", root.join("link_inside")).expect("error creating symlink");
+            std::os::unix::fs::symlink("../secret.txt", root.join("link_outside")).expect("error creating symlink");
+
+            let canonical_root = std::fs::canonicalize(&root).expect("error canonicalizing test root");
+            TestSite {
+                base,
+                root,
+                canonical_root,
+            }
+        }
+
+        async fn resolve(&self, url_path: &str) -> Option<PathBuf> {
+            resolve_path(&self.canonical_root, &self.root, url_path).await
+        }
+    }
+
+    impl Drop for TestSite {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
+    #[test]
+    fn test_sanitize_url_path() {
+        assert_eq!(sanitize_url_path("index.html"), Some(PathBuf::from("index.html")));
+        assert_eq!(sanitize_url_path(""), Some(PathBuf::new()));
+        // empty and "." segments are normalized away
+        assert_eq!(sanitize_url_path("a//b/./c"), Some(PathBuf::from("a/b/c")));
+        // percent-decoding is applied before checks
+        assert_eq!(sanitize_url_path("a%20b.txt"), Some(PathBuf::from("a b.txt")));
+        assert_eq!(sanitize_url_path("%2e%2e%2fsecret"), None);
+        assert_eq!(sanitize_url_path("..%2fsecret"), None);
+        // dot-dot segments are rejected
+        assert_eq!(sanitize_url_path("../secret"), None);
+        assert_eq!(sanitize_url_path("a/../../secret"), None);
+        // backslashes are rejected
+        assert_eq!(sanitize_url_path("..\\secret"), None);
+        assert_eq!(sanitize_url_path("a\\b"), None);
+        // invalid percent-encoding and NUL bytes are rejected
+        assert_eq!(sanitize_url_path("%zz"), None);
+        assert_eq!(sanitize_url_path("a%00b"), None);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_regular_files() {
+        let site = TestSite::new();
+
+        let index = site.resolve("index.html").await.expect("index.html should resolve");
+        assert_eq!(index, site.canonical_root.join("index.html"));
+
+        // empty path resolves to the root's index.html
+        let index = site.resolve("").await.expect("root should resolve to index.html");
+        assert_eq!(index, site.canonical_root.join("index.html"));
+
+        // directories resolve to their index.html
+        let index = site.resolve("sub").await.expect("sub should resolve to sub/index.html");
+        assert_eq!(index, site.canonical_root.join("sub/index.html"));
+
+        // extension-less paths fall back to .html
+        let page = site.resolve("page").await.expect("page should resolve to page.html");
+        assert_eq!(page, site.canonical_root.join("page.html"));
+
+        // symlinks staying inside the root resolve to their canonical target
+        let link = site.resolve("link_inside").await.expect("link_inside should resolve");
+        assert_eq!(link, site.canonical_root.join("sub/file.txt"));
+
+        // normalized equivalent paths resolve to the same canonical file
+        let file = site.resolve("sub/./file.txt").await.expect("path should resolve");
+        assert_eq!(file, site.canonical_root.join("sub/file.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_rejects_paths_outside_root() {
+        let site = TestSite::new();
+
+        // plain, percent-encoded and mixed dot-dot traversal
+        assert_eq!(site.resolve("../secret.txt").await, None);
+        assert_eq!(site.resolve("%2e%2e/secret.txt").await, None);
+        assert_eq!(site.resolve("..%2fsecret.txt").await, None);
+        assert_eq!(site.resolve("sub/../../secret.txt").await, None);
+        // backslash traversal
+        assert_eq!(site.resolve("..\\secret.txt").await, None);
+        // symlink escaping the root
+        assert_eq!(site.resolve("link_outside").await, None);
+        // non-existent files
+        assert_eq!(site.resolve("nope.txt").await, None);
+        assert_eq!(site.resolve("nope").await, None);
     }
 }

@@ -53,6 +53,7 @@ maxminddb = { workspace = true }
 mimalloc = { workspace = true }
 media_type = { workspace = true }
 moka = { workspace = true, features = ["future"] }
+percent-encoding = "2"
 rand = { workspace = true }
 rcgen = { workspace = true, default-features = false, features = ["crypto", "aws_lc_rs", "pem"]}
 # disable TLS 1.2 support
