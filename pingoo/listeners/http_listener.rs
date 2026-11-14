@@ -21,8 +21,8 @@ use crate::{
     services::{
         HttpService,
         http_utils::{
-            HOSTNAME_MAX_LENGTH, RequestContext, RequestExtensionContext, USER_AGENT_MAX_LENGTH, get_path,
-            new_blocked_response, new_not_found_error,
+            HOSTNAME_MAX_LENGTH, RequestContext, RequestExtensionContext, USER_AGENT_MAX_LENGTH,
+            new_blocked_response, new_not_found_error, normalize_path_for_matching,
         },
     },
 };
@@ -138,7 +138,16 @@ pub(super) async fn serve_http_requests<IO: hyper::rt::Read + hyper::rt::Write +
         let captcha_manager = captcha_manager.clone();
         async move {
             let host = get_host(&req);
-            let path = get_path(&req).to_string();
+            // Rules and routing are evaluated against a normalized view of the path,
+            // because upstreams normalize paths before serving them. The original URI
+            // (including the query string) is left untouched and forwarded as-is.
+            let path = match normalize_path_for_matching(req.uri().path()) {
+                Ok(path) => path,
+                Err(err) => {
+                    debug!("rejecting request with invalid path {:?}: {err}", req.uri().path());
+                    return Ok(new_blocked_response());
+                }
+            };
 
             let geoip_record = match geoip.as_ref() {
                 Some(geoip_db) => {

@@ -114,3 +114,158 @@ pub fn new_method_not_allowed_error() -> Response<BoxBody<Bytes, hyper::Error>> 
 pub fn get_path(req: &Request<Incoming>) -> &str {
     req.uri().path().trim_end_matches('/')
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PathNormalizationError {
+    #[error("path contains an encoded NUL byte")]
+    EncodedNul,
+    #[error("path contains a dot-segment escaping the root")]
+    DotSegmentEscape,
+    #[error("path contains an invalid percent-encoding escape")]
+    InvalidEscape,
+    #[error("path is not valid UTF-8 after percent-decoding")]
+    InvalidUtf8,
+}
+
+/// Normalize a request path into a canonical, safe view used exclusively for rule matching.
+///
+/// The upstream server may normalize the path (percent-decoding, collapsing repeated
+/// separators, resolving dot-segments) before serving it, so rules must be evaluated
+/// against the same normalized view to avoid bypasses such as `/safe/..%2fadmin`.
+///
+/// The original URI is never modified: the request is forwarded to upstreams untouched.
+///
+/// The normalization:
+/// - percent-decodes the path (hex digits are case-insensitive, e.g. `%2f` == `%2F`)
+/// - rejects encoded NUL bytes (`%00`), invalid escapes (e.g. `%zz`, truncated `%2`)
+///   and decoded output that is not valid UTF-8
+/// - treats both `/` and `\` as separators and collapses repeated separators
+/// - resolves `.` and `..` dot-segments, rejecting `..` segments that escape the root
+/// - trims trailing separators, so `/` normalizes to an empty string
+pub fn normalize_path_for_matching(raw_path: &str) -> Result<String, PathNormalizationError> {
+    fn hex_value(byte: u8) -> Result<u8, PathNormalizationError> {
+        match byte {
+            b'0'..=b'9' => Ok(byte - b'0'),
+            b'a'..=b'f' => Ok(byte - b'a' + 10),
+            b'A'..=b'F' => Ok(byte - b'A' + 10),
+            _ => Err(PathNormalizationError::InvalidEscape),
+        }
+    }
+
+    let raw_bytes = raw_path.as_bytes();
+    let mut decoded_bytes: Vec<u8> = Vec::with_capacity(raw_bytes.len());
+    let mut index = 0;
+    while index < raw_bytes.len() {
+        let byte = raw_bytes[index];
+        if byte == b'%' {
+            if index + 3 > raw_bytes.len() {
+                return Err(PathNormalizationError::InvalidEscape);
+            }
+            let decoded_byte = hex_value(raw_bytes[index + 1])? * 16 + hex_value(raw_bytes[index + 2])?;
+            if decoded_byte == 0 {
+                return Err(PathNormalizationError::EncodedNul);
+            }
+            decoded_bytes.push(decoded_byte);
+            index += 3;
+        } else {
+            decoded_bytes.push(byte);
+            index += 1;
+        }
+    }
+
+    let decoded_path = String::from_utf8(decoded_bytes).map_err(|_| PathNormalizationError::InvalidUtf8)?;
+
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in decoded_path.split(['/', '\\']) {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop().ok_or(PathNormalizationError::DotSegmentEscape)?;
+            }
+            segment => segments.push(segment),
+        }
+    }
+
+    let mut normalized_path = String::with_capacity(decoded_path.len());
+    for segment in segments {
+        normalized_path.push('/');
+        normalized_path.push_str(segment);
+    }
+
+    return Ok(normalized_path);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_simple_paths() {
+        assert_eq!(normalize_path_for_matching("/"), Ok("".to_string()));
+        assert_eq!(normalize_path_for_matching("/admin"), Ok("/admin".to_string()));
+        assert_eq!(normalize_path_for_matching("/admin/"), Ok("/admin".to_string()));
+        assert_eq!(normalize_path_for_matching("/a/b/c"), Ok("/a/b/c".to_string()));
+    }
+
+    #[test]
+    fn collapses_repeated_separators() {
+        assert_eq!(normalize_path_for_matching("//admin"), Ok("/admin".to_string()));
+        assert_eq!(normalize_path_for_matching("/a//b///c"), Ok("/a/b/c".to_string()));
+        assert_eq!(normalize_path_for_matching("/a/./b/./c"), Ok("/a/b/c".to_string()));
+    }
+
+    #[test]
+    fn decodes_percent_encoded_characters_case_insensitively() {
+        assert_eq!(normalize_path_for_matching("/%61dmin"), Ok("/admin".to_string()));
+        assert_eq!(normalize_path_for_matching("/%2Fadmin"), Ok("/admin".to_string()));
+        assert_eq!(normalize_path_for_matching("/%2fadmin"), Ok("/admin".to_string()));
+        assert_eq!(normalize_path_for_matching("/%2E%2E/admin"), Err(PathNormalizationError::DotSegmentEscape));
+        assert_eq!(normalize_path_for_matching("/%2e%2E/admin"), Err(PathNormalizationError::DotSegmentEscape));
+    }
+
+    #[test]
+    fn resolves_in_bounds_dot_segments() {
+        // the canonical WAF bypass: upstreams normalize it to /admin
+        assert_eq!(normalize_path_for_matching("/safe/..%2fadmin"), Ok("/admin".to_string()));
+        assert_eq!(normalize_path_for_matching("/safe/../admin"), Ok("/admin".to_string()));
+        assert_eq!(normalize_path_for_matching("/a/b/../../c"), Ok("/c".to_string()));
+    }
+
+    #[test]
+    fn rejects_dot_segments_escaping_root() {
+        assert_eq!(normalize_path_for_matching("/../admin"), Err(PathNormalizationError::DotSegmentEscape));
+        assert_eq!(normalize_path_for_matching("/.."), Err(PathNormalizationError::DotSegmentEscape));
+        assert_eq!(normalize_path_for_matching("/a/../../b"), Err(PathNormalizationError::DotSegmentEscape));
+    }
+
+    #[test]
+    fn rejects_encoded_nul() {
+        assert_eq!(normalize_path_for_matching("/admin%00"), Err(PathNormalizationError::EncodedNul));
+        assert_eq!(normalize_path_for_matching("/admin%00.html"), Err(PathNormalizationError::EncodedNul));
+    }
+
+    #[test]
+    fn rejects_invalid_escapes() {
+        assert_eq!(normalize_path_for_matching("/admin%zz"), Err(PathNormalizationError::InvalidEscape));
+        assert_eq!(normalize_path_for_matching("/admin%2"), Err(PathNormalizationError::InvalidEscape));
+        assert_eq!(normalize_path_for_matching("/admin%"), Err(PathNormalizationError::InvalidEscape));
+        assert_eq!(normalize_path_for_matching("/admin%a"), Err(PathNormalizationError::InvalidEscape));
+    }
+
+    #[test]
+    fn rejects_invalid_utf8() {
+        assert_eq!(normalize_path_for_matching("/%ff%fe"), Err(PathNormalizationError::InvalidUtf8));
+    }
+
+    #[test]
+    fn treats_backslash_as_separator() {
+        assert_eq!(normalize_path_for_matching("/a\\b"), Ok("/a/b".to_string()));
+        assert_eq!(normalize_path_for_matching("/safe\\..\\admin"), Ok("/admin".to_string()));
+        assert_eq!(normalize_path_for_matching("/%5cadmin"), Ok("/admin".to_string()));
+    }
+
+    #[test]
+    fn decodes_valid_utf8() {
+        assert_eq!(normalize_path_for_matching("/%e4%b8%ad"), Ok("/中".to_string()));
+    }
+}
