@@ -30,8 +30,10 @@ impl TcpService for TcpProxyService {
     async fn serve_connection(
         self: Arc<Self>,
         mut inbound_tcp_connection: Box<dyn DynIo>,
-        _client_socket_address: SocketAddr,
+        client_socket_address: SocketAddr,
     ) {
+        debug!("[{}]: new connection from {client_socket_address}", self.name);
+
         let mut outbound_stream = match retry(
             || {
                 let self = self.clone();

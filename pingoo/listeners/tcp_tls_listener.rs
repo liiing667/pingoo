@@ -5,6 +5,7 @@ use tracing::debug;
 
 use crate::{
     Error,
+    client_addr::{self, TrustedProxies},
     config::ListenerConfig,
     listeners::{GRACEFUL_SHUTDOWN_TIMEOUT, Listener, accept_tcp_connection, accept_tls_connection, bind_tcp_socket},
     services::TcpService,
@@ -17,6 +18,7 @@ pub struct TcpAndTlsListener {
     socket: Option<tokio::net::TcpListener>,
     tls_manager: Arc<TlsManager>,
     service: Arc<dyn TcpService>,
+    trusted_proxies: Arc<TrustedProxies>,
 }
 
 impl TcpAndTlsListener {
@@ -27,6 +29,7 @@ impl TcpAndTlsListener {
             socket: None,
             tls_manager,
             service,
+            trusted_proxies: Arc::new(TrustedProxies::new(config.trusted_proxies)),
         };
     }
 }
@@ -60,10 +63,13 @@ impl Listener for TcpAndTlsListener {
                     let tls_server_config = tls_server_config.clone();
                     let name = self.name.clone();
                     let tls_manager = self.tls_manager.clone();
+                    let trusted_proxies = self.trusted_proxies.clone();
                     connections.spawn(async move {
                         if let Ok(Some(tls_stream)) =
                             accept_tls_connection(tcp_stream, tls_manager, client_socket_addr, &name, tls_server_config).await {
-                            service.serve_connection(Box::new(tls_stream), client_socket_addr).await;
+                            let client_addr =
+                                client_addr::resolve_client_addr(client_socket_addr, &[], &trusted_proxies);
+                            service.serve_connection(Box::new(tls_stream), client_addr.client_addr).await;
                         }
                     });
                 },

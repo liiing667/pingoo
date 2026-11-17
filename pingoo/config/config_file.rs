@@ -37,6 +37,8 @@ pub struct ConfigFile {
 pub struct ListenerConfigFile {
     pub address: ListenerAddressConfigFile,
     pub services: Option<Vec<String>>,
+    #[serde(default)]
+    pub trusted_proxies: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug)]

@@ -14,6 +14,7 @@ use tracing::{debug, error};
 use crate::{
     Error,
     captcha::{CAPTCHA_VERIFIED_COOKIE, CaptchaManager, generate_captcha_client_id},
+    client_addr::{self, TrustedProxies},
     config::ListenerConfig,
     geoip::{self, GeoipDB, GeoipRecord},
     listeners::{GRACEFUL_SHUTDOWN_TIMEOUT, Listener, accept_tcp_connection, bind_tcp_socket},
@@ -36,6 +37,7 @@ pub struct HttpListener {
     lists: Arc<bel::Value>,
     geoip: Option<Arc<GeoipDB>>,
     captcha_manager: Arc<CaptchaManager>,
+    trusted_proxies: Arc<TrustedProxies>,
 }
 
 impl HttpListener {
@@ -56,6 +58,7 @@ impl HttpListener {
             lists,
             geoip,
             captcha_manager,
+            trusted_proxies: Arc::new(TrustedProxies::new(config.trusted_proxies)),
         };
     }
 }
@@ -98,6 +101,7 @@ impl Listener for HttpListener {
                         self.lists.clone(),
                         self.geoip.clone(),
                         self.captcha_manager.clone(),
+                        self.trusted_proxies.clone(),
                         false,
                         graceful_shutdown.watcher(),
                     ));
@@ -127,22 +131,44 @@ pub(super) async fn serve_http_requests<IO: hyper::rt::Read + hyper::rt::Write +
     lists: Arc<bel::Value>,
     geoip: Option<Arc<GeoipDB>>,
     captcha_manager: Arc<CaptchaManager>,
+    trusted_proxies: Arc<TrustedProxies>,
     use_tls: bool,
     graceful_shutdown_watcher: graceful::Watcher,
 ) {
+    let listener_name_for_handler = listener_name.clone();
     let hyper_handler = service_fn(move |mut req| {
         let services = services.clone();
         let rules = rules.clone();
         let lists = lists.clone();
         let geoip = geoip.clone();
         let captcha_manager = captcha_manager.clone();
+        let trusted_proxies = trusted_proxies.clone();
+        let listener_name = listener_name_for_handler.clone();
         async move {
             let host = get_host(&req);
             let path = get_path(&req).to_string();
 
+            // resolve the client address once per request. The determination is shared
+            // by GeoIP, the rules engine, the captcha, logs and proxying.
+            let x_forwarded_for: Vec<&str> = req
+                .headers()
+                .get_all("x-forwarded-for")
+                .iter()
+                .filter_map(|header_value| header_value.to_str().ok())
+                .collect();
+            let client_addr = client_addr::resolve_client_addr(client_socket_addr, &x_forwarded_for, &trusted_proxies);
+            if client_addr.client_addr != client_addr.socket_addr {
+                debug!(
+                    listener = listener_name.as_ref(),
+                    socket_addr = %client_addr.socket_addr,
+                    client_addr = %client_addr.client_addr,
+                    "client address resolved via trusted proxies"
+                );
+            }
+
             let geoip_record = match geoip.as_ref() {
                 Some(geoip_db) => {
-                    let client_ip = client_socket_addr.ip();
+                    let client_ip = client_addr.client_addr.ip();
                     match geoip_db.lookup(client_ip).await {
                         Ok(geoip_record) => geoip_record,
                         Err(err) => {
@@ -164,7 +190,7 @@ pub(super) async fn serve_http_requests<IO: hyper::rt::Read + hyper::rt::Write +
             )
             .unwrap_or_default();
 
-            let client_id = generate_captcha_client_id(client_socket_addr.ip(), &user_agent, &host);
+            let client_id = generate_captcha_client_id(client_addr.client_addr.ip(), &user_agent, &host);
 
             let parsed_cookies = if let Some((_, cookies_header)) = req
                 .headers()
@@ -181,7 +207,8 @@ pub(super) async fn serve_http_requests<IO: hyper::rt::Read + hyper::rt::Write +
             };
 
             let request_context = Arc::new(RequestContext {
-                client_address: client_socket_addr,
+                client_address: client_addr.client_addr,
+                forwarded_chain: client_addr.forwarded_chain.clone(),
                 server_address: listener_address,
                 asn: geoip_record.asn,
                 country: geoip_record.country,

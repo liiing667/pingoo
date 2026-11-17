@@ -8,6 +8,7 @@ use std::{
 
 use http::StatusCode;
 use indexmap::IndexMap;
+use ipnetwork::IpNetwork;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tracing::{debug, warn};
@@ -62,6 +63,7 @@ pub struct ListenerConfig {
     pub address: SocketAddr,
     pub protocol: ListenerProtocol,
     pub services: Vec<String>,
+    pub trusted_proxies: Vec<IpNetwork>,
 }
 
 #[derive(Debug, Clone)]
@@ -241,15 +243,21 @@ pub async fn load_and_validate() -> Result<Config, Error> {
     let listeners: Vec<ListenerConfig> = config_file
         .listeners
         .into_iter()
-        .map(|(name, listener_config)| ListenerConfig {
-            name: name,
-            address: listener_config.address.socket_address,
-            protocol: listener_config.address.protocol,
-            services: listener_config
-                .services
-                .unwrap_or(default_services_for_listener(listener_config.address.protocol)),
+        .map(|(name, listener_config)| {
+            Ok(ListenerConfig {
+                trusted_proxies: parse_trusted_proxies(
+                    &name,
+                    listener_config.trusted_proxies.as_deref().unwrap_or(&[]),
+                )?,
+                name: name,
+                address: listener_config.address.socket_address,
+                protocol: listener_config.address.protocol,
+                services: listener_config
+                    .services
+                    .unwrap_or(default_services_for_listener(listener_config.address.protocol)),
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, Error>>()?;
     validate_listeners_config(&listeners, &services)?;
 
     let rules: Vec<Rule> = config_file
@@ -447,4 +455,49 @@ fn default_docker_socket() -> String {
 
 fn default_tls_acme_directory_url() -> String {
     return LETSENCRYPT_PRODUCTION_URL.to_string();
+}
+
+fn parse_trusted_proxies(listener_name: &str, cidrs: &[String]) -> Result<Vec<IpNetwork>, Error> {
+    return cidrs
+        .iter()
+        .map(|cidr| {
+            cidr.trim().parse::<IpNetwork>().map_err(|err| {
+                Error::Config(format!(
+                    "listeners.[{listener_name}].trusted_proxies: {cidr} is not a valid IP or CIDR: {err}"
+                ))
+            })
+        })
+        .collect();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_trusted_proxies_accepts_ips_and_cidrs() {
+        let networks = parse_trusted_proxies(
+            "http",
+            &[
+                "10.0.0.0/8".to_string(),
+                "192.168.1.1".to_string(),
+                "fd00::/8".to_string(),
+            ],
+        )
+        .expect("trusted proxies should parse");
+        assert_eq!(networks.len(), 3);
+        assert!(networks[1].contains("192.168.1.1".parse().expect("valid IP")));
+    }
+
+    #[test]
+    fn parse_trusted_proxies_rejects_invalid_entries() {
+        let result = parse_trusted_proxies("http", &["not-a-cidr".to_string()]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_trusted_proxies_defaults_to_empty() {
+        let networks = parse_trusted_proxies("http", &[]).expect("empty trusted proxies should parse");
+        assert!(networks.is_empty());
+    }
 }

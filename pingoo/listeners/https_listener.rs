@@ -7,6 +7,7 @@ use tracing::debug;
 use crate::{
     Error,
     captcha::CaptchaManager,
+    client_addr::TrustedProxies,
     config::ListenerConfig,
     geoip::GeoipDB,
     listeners::{
@@ -28,6 +29,7 @@ pub struct HttpsListener {
     lists: Arc<bel::Value>,
     geoip: Option<Arc<GeoipDB>>,
     captcha_manager: Arc<CaptchaManager>,
+    trusted_proxies: Arc<TrustedProxies>,
 }
 
 impl HttpsListener {
@@ -50,6 +52,7 @@ impl HttpsListener {
             lists,
             geoip,
             captcha_manager,
+            trusted_proxies: Arc::new(TrustedProxies::new(config.trusted_proxies)),
         };
     }
 }
@@ -104,6 +107,7 @@ impl Listener for HttpsListener {
                             self.lists.clone(),
                             self.geoip.clone(),
                             self.captcha_manager.clone(),
+                            self.trusted_proxies.clone(),
                             true,
                             graceful_shutdown.watcher(),
                         )

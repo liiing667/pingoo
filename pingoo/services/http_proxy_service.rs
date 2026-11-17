@@ -142,18 +142,16 @@ impl HttpService for HttpProxyService {
         let client_ip = request_context.client_address.ip();
         let client_ip_str = Arc::new(client_ip.to_string());
 
-        // TODO: allow users to configure if they trust the x-forwarded-for header or no
-        let forwarded_for_from_client = req
-            .headers()
-            .get_all("x-forwarded-for")
+        // Only forward the X-Forwarded-For entries that were verified against the listener's
+        // trusted proxies (see client_addr::resolve_client_addr). Entries forged by direct
+        // clients are dropped so bans and rate limits upstream can't be bypassed.
+        let mut forwarded_for_entries: Vec<String> = request_context
+            .forwarded_chain
             .iter()
-            .map(|header_value| header_value.to_str().unwrap_or_default())
-            .collect::<Vec<_>>();
-        let forwarded_for_to_upstream = if forwarded_for_from_client.is_empty() {
-            client_ip_str.clone()
-        } else {
-            Arc::new(forwarded_for_from_client.join(", ") + format!(", {client_ip}").as_str())
-        };
+            .map(|ip| ip.to_string())
+            .collect();
+        forwarded_for_entries.push(client_ip_str.as_str().to_string());
+        let forwarded_for_to_upstream = forwarded_for_entries.join(", ");
         if let Ok(forwarded_for) = HeaderValue::from_str(&forwarded_for_to_upstream) {
             req.headers_mut().insert("x-forwarded-for", forwarded_for);
         }

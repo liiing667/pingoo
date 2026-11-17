@@ -8,6 +8,7 @@ mod config;
 mod server;
 
 mod captcha;
+mod client_addr;
 mod crypto_utils;
 mod error;
 mod geoip;

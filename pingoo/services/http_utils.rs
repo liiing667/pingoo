@@ -1,4 +1,7 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+};
 
 use bytes::Bytes;
 use http::{HeaderValue, Request, Response, StatusCode, header};
@@ -22,7 +25,10 @@ pub const HOSTNAME_MAX_LENGTH: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct RequestContext {
+    /// The resolved address of the client, shared by rules, GeoIP, logs and proxying.
     pub client_address: SocketAddr,
+    /// The verified X-Forwarded-For entries vouched for by trusted proxies.
+    pub forwarded_chain: Vec<IpAddr>,
     pub server_address: SocketAddr,
     pub asn: u32,
     pub country: CountryCode,

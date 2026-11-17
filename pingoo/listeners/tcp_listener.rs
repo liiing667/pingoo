@@ -5,6 +5,7 @@ use tracing::debug;
 
 use crate::{
     Error,
+    client_addr::{self, TrustedProxies},
     config::ListenerConfig,
     listeners::{GRACEFUL_SHUTDOWN_TIMEOUT, Listener, accept_tcp_connection, bind_tcp_socket},
     services::TcpService,
@@ -15,6 +16,7 @@ pub struct TcpListener {
     address: SocketAddr,
     socket: Option<tokio::net::TcpListener>,
     service: Arc<dyn TcpService>,
+    trusted_proxies: Arc<TrustedProxies>,
 }
 
 impl TcpListener {
@@ -24,6 +26,7 @@ impl TcpListener {
             address: config.address,
             socket: None,
             service,
+            trusted_proxies: Arc::new(TrustedProxies::new(config.trusted_proxies)),
         };
     }
 }
@@ -52,7 +55,11 @@ impl Listener for TcpListener {
                     };
 
                     let service = self.service.clone();
-                    connections.spawn(service.serve_connection(Box::new(tcp_stream), client_socket_addr));
+                    // TCP connections carry no proxy headers, so the shared determination
+                    // always resolves to the direct peer address.
+                    let client_addr =
+                        client_addr::resolve_client_addr(client_socket_addr, &[], &self.trusted_proxies);
+                    connections.spawn(service.serve_connection(Box::new(tcp_stream), client_addr.client_addr));
                 },
                  _ = shutdown_signal.changed() => {
                     break;
