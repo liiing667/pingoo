@@ -15,7 +15,7 @@ use hyper::body::Frame;
 use moka::future::Cache;
 use tokio::fs::{self, File};
 use tokio_util::io::ReaderStream;
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 
 use crate::{
     config::{ServiceConfig, StaticSiteServiceConfig},
@@ -67,16 +67,10 @@ impl StaticSiteService {
 
 #[async_trait::async_trait]
 impl HttpService for StaticSiteService {
-    fn match_request(&self, ctx: &rules::Context) -> bool {
+    fn match_request(&self, ctx: &rules::Context) -> rules::MatchOutcome {
         match &self.route {
-            None => true,
-            Some(route) => match route.execute(&ctx) {
-                Ok(value) => value == true.into(),
-                Err(err) => {
-                    warn!("error executing route for service {}: {err}", self.name);
-                    false
-                }
-            },
+            None => rules::MatchOutcome::Matched,
+            Some(route) => rules::evaluate_expression(route, ctx),
         }
     }
 
@@ -272,5 +266,89 @@ async fn try_metadata(path: &PathBuf) -> Result<Metadata, Response<BoxBody<Bytes
             error!("error getting metadata for static file: {path:?}: {err}");
             Err(new_internal_error_response_500())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use http::StatusCode;
+
+    use super::*;
+    use crate::{
+        config::{ServiceConfig, StaticSiteServiceConfig, StaticSiteServiceNotFound},
+        services::HttpService,
+    };
+
+    fn context() -> rules::Context<'static> {
+        #[derive(serde::Serialize)]
+        struct HttpRequest {
+            path: String,
+        }
+
+        let mut context = rules::Context::default();
+        context
+            .add_variable(
+                "http_request",
+                HttpRequest {
+                    path: "/assets/app.js".to_string(),
+                },
+            )
+            .expect("http_request variable");
+        return context;
+    }
+
+    fn service_with_route(route: &str) -> StaticSiteService {
+        let config = ServiceConfig {
+            name: "static".to_string(),
+            route: Some(rules::compile_expression(route).expect("valid route expression")),
+            http_proxy: None,
+            r#static: Some(StaticSiteServiceConfig {
+                root: PathBuf::from("/tmp/pingoo-static-test"),
+                not_found: StaticSiteServiceNotFound {
+                    file: None,
+                    status_code: StatusCode::NOT_FOUND,
+                },
+            }),
+            tcp_proxy: None,
+        };
+        return StaticSiteService::new(config);
+    }
+
+    #[test]
+    fn service_without_route_always_matches() {
+        let config = ServiceConfig {
+            name: "static".to_string(),
+            route: None,
+            http_proxy: None,
+            r#static: Some(StaticSiteServiceConfig {
+                root: PathBuf::from("/tmp/pingoo-static-test"),
+                not_found: StaticSiteServiceNotFound {
+                    file: None,
+                    status_code: StatusCode::NOT_FOUND,
+                },
+            }),
+            tcp_proxy: None,
+        };
+        let service = StaticSiteService::new(config);
+
+        assert_eq!(service.match_request(&context()), rules::MatchOutcome::Matched);
+    }
+
+    #[test]
+    fn valid_route_keeps_normal_routing_semantics() {
+        let service = service_with_route("http_request.path.starts_with(\"/assets\")");
+        assert_eq!(service.match_request(&context()), rules::MatchOutcome::Matched);
+
+        let service = service_with_route("http_request.path == \"/nope\"");
+        assert_eq!(service.match_request(&context()), rules::MatchOutcome::NotMatched);
+    }
+
+    #[test]
+    fn undecidable_route_is_indeterminate_and_not_forwarded() {
+        let service = service_with_route("unknown_variable == 1");
+        assert_eq!(service.match_request(&context()), rules::MatchOutcome::Indeterminate);
+
+        let service = service_with_route("http_request.path + 1 == \"x\"");
+        assert_eq!(service.match_request(&context()), rules::MatchOutcome::Indeterminate);
     }
 }

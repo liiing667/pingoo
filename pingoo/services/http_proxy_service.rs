@@ -9,7 +9,7 @@ use hyper_util::{
     rt::TokioExecutor,
 };
 use rand::{rng, seq::IndexedRandom};
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 
 use crate::{
     config::ServiceConfig,
@@ -81,16 +81,10 @@ impl HttpProxyService {
 
 #[async_trait::async_trait]
 impl HttpService for HttpProxyService {
-    fn match_request(&self, ctx: &rules::Context) -> bool {
+    fn match_request(&self, ctx: &rules::Context) -> rules::MatchOutcome {
         match &self.route {
-            None => true,
-            Some(route) => match route.execute(&ctx) {
-                Ok(value) => value == true.into(),
-                Err(err) => {
-                    warn!("error executing route for service {}: {err}", self.name);
-                    false
-                }
-            },
+            None => rules::MatchOutcome::Matched,
+            Some(route) => rules::evaluate_expression(route, ctx),
         }
     }
 
@@ -204,5 +198,84 @@ impl HttpService for HttpProxyService {
         let boxed_body: BoxBody<Bytes, hyper::Error> = BoxBody::new(body);
         // Ok(Response::from_parts(parts, boxed_body))
         return Response::from_parts(parts, boxed_body);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        config::{ServiceConfig, ServiceDiscoveryConfig},
+        service_discovery::service_registry::ServiceRegistry,
+        services::HttpService,
+    };
+
+    fn context() -> rules::Context<'static> {
+        #[derive(serde::Serialize)]
+        struct HttpRequest {
+            host: String,
+            path: String,
+        }
+
+        let mut context = rules::Context::default();
+        context
+            .add_variable(
+                "http_request",
+                HttpRequest {
+                    host: "api.example.com".to_string(),
+                    path: "/v1/users".to_string(),
+                },
+            )
+            .expect("http_request variable");
+        return context;
+    }
+
+    async fn service_with_route(route: &str) -> HttpProxyService {
+        let config = ServiceConfig {
+            name: "proxy".to_string(),
+            route: Some(rules::compile_expression(route).expect("valid route expression")),
+            http_proxy: Some(vec![]),
+            r#static: None,
+            tcp_proxy: None,
+        };
+        let registry = ServiceRegistry::new(&ServiceDiscoveryConfig::default(), std::slice::from_ref(&config))
+            .await
+            .expect("service registry");
+        return HttpProxyService::new(config, Arc::new(registry));
+    }
+
+    #[tokio::test]
+    async fn proxy_without_route_always_matches() {
+        let config = ServiceConfig {
+            name: "proxy".to_string(),
+            route: None,
+            http_proxy: Some(vec![]),
+            r#static: None,
+            tcp_proxy: None,
+        };
+        let registry = ServiceRegistry::new(&ServiceDiscoveryConfig::default(), std::slice::from_ref(&config))
+            .await
+            .expect("service registry");
+        let service = HttpProxyService::new(config, Arc::new(registry));
+
+        assert_eq!(service.match_request(&context()), rules::MatchOutcome::Matched);
+    }
+
+    #[tokio::test]
+    async fn valid_proxy_route_keeps_normal_routing_semantics() {
+        let matched = service_with_route("http_request.path.starts_with(\"/v1\")").await;
+        assert_eq!(matched.match_request(&context()), rules::MatchOutcome::Matched);
+
+        let not_matched = service_with_route("http_request.path == \"/healthz\"").await;
+        assert_eq!(not_matched.match_request(&context()), rules::MatchOutcome::NotMatched);
+    }
+
+    #[tokio::test]
+    async fn undecidable_proxy_route_is_indeterminate_and_not_forwarded() {
+        let service = service_with_route("unknown_variable == 1").await;
+        assert_eq!(service.match_request(&context()), rules::MatchOutcome::Indeterminate);
+
+        let service = service_with_route("1 / 0 == 1").await;
+        assert_eq!(service.match_request(&context()), rules::MatchOutcome::Indeterminate);
     }
 }

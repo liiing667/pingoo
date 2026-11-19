@@ -1762,6 +1762,7 @@ dependencies = [
  "chrono",
  "serde",
  "thiserror 2.0.21 (registry+https://github.com/rust-lang/crates.io-index)",
+ "tracing",
  "uuid 0.1.0",
 ]
 

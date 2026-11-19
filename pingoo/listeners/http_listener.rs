@@ -22,7 +22,7 @@ use crate::{
         HttpService,
         http_utils::{
             HOSTNAME_MAX_LENGTH, RequestContext, RequestExtensionContext, USER_AGENT_MAX_LENGTH, get_path,
-            new_blocked_response, new_not_found_error,
+            new_blocked_response, new_internal_error_response_500, new_not_found_error,
         },
     },
 };
@@ -130,12 +130,14 @@ pub(super) async fn serve_http_requests<IO: hyper::rt::Read + hyper::rt::Write +
     use_tls: bool,
     graceful_shutdown_watcher: graceful::Watcher,
 ) {
+    let handler_listener_name = Arc::clone(&listener_name);
     let hyper_handler = service_fn(move |mut req| {
         let services = services.clone();
         let rules = rules.clone();
         let lists = lists.clone();
         let geoip = geoip.clone();
         let captcha_manager = captcha_manager.clone();
+        let listener_name = Arc::clone(&handler_listener_name);
         async move {
             let host = get_host(&req);
             let path = get_path(&req).to_string();
@@ -237,35 +239,83 @@ pub(super) async fn serve_http_requests<IO: hyper::rt::Read + hyper::rt::Write +
 
             // rules_ctx is ued for both rules matching and HTTP requests routing
             let mut rules_ctx = ::rules::Context::default();
-            // ctx.add_function("", value);
-            // TODO: log error?
+            // Fail closed: if the request fields can not be serialized into the evaluation
+            // context, any rule or route referencing them would be undecidable.
             if let Err(err) = rules_ctx.add_variable("http_request", request_data) {
-                debug!("rules: error adding http_request variable: {err}")
+                error!(
+                    listener = listener_name.as_ref(),
+                    reason = "context_variable_injection_failed",
+                    variable = "http_request",
+                    error = %err,
+                    "can not build the rules context; failing closed"
+                );
+                return Ok(new_internal_error_response_500());
             }
             if let Err(err) = rules_ctx.add_variable("client", &client_data) {
-                debug!("rules: error adding client variable: {err}")
+                error!(
+                    listener = listener_name.as_ref(),
+                    reason = "context_variable_injection_failed",
+                    variable = "client",
+                    error = %err,
+                    "can not build the rules context; failing closed"
+                );
+                return Ok(new_internal_error_response_500());
             }
             // TODO: is it really fast? Make sure than no extra clone for the list happen. Only Arc clones
             rules_ctx.add_variable_from_value("lists", &*lists);
 
             for rule in rules.as_ref() {
-                if rule.match_request(&rules_ctx) {
-                    for action in &rule.actions {
-                        match action {
-                            Action::Block {} => return Ok(new_blocked_response()),
-                            Action::Captcha {} => {
-                                if !captcha_verified {
-                                    return Ok(captcha_manager.serve_captcha());
+                match rule.match_request(&rules_ctx) {
+                    rules::MatchOutcome::Matched => {
+                        if rule.actions.is_empty() {
+                            error!(
+                                listener = listener_name.as_ref(),
+                                rule = rule.name.as_str(),
+                                reason = "rule_without_actions",
+                                "rule matched but declares no action; blocking the request"
+                            );
+                            return Ok(new_blocked_response());
+                        }
+                        for action in &rule.actions {
+                            match action {
+                                Action::Block {} => return Ok(new_blocked_response()),
+                                Action::Captcha {} => {
+                                    if !captcha_verified {
+                                        return Ok(captcha_manager.serve_captcha());
+                                    }
                                 }
                             }
                         }
                     }
+                    // fail closed: an undecidable rule must never be treated as a non-match
+                    rules::MatchOutcome::Indeterminate => {
+                        error!(
+                            listener = listener_name.as_ref(),
+                            rule = rule.name.as_str(),
+                            reason = "rule_evaluation_indeterminate",
+                            "rule can not be evaluated; blocking the request"
+                        );
+                        return Ok(new_blocked_response());
+                    }
+                    rules::MatchOutcome::NotMatched => continue,
                 }
             }
 
             for service in services.as_ref() {
-                if service.match_request(&rules_ctx) {
-                    return Ok(service.handle_http_request(req).await);
+                match service.match_request(&rules_ctx) {
+                    rules::MatchOutcome::Matched => {
+                        return Ok(service.handle_http_request(req).await);
+                    }
+                    // fail closed: an undecidable route must never be forwarded to an upstream
+                    rules::MatchOutcome::Indeterminate => {
+                        error!(
+                            listener = listener_name.as_ref(),
+                            reason = "route_evaluation_indeterminate",
+                            "service route can not be evaluated; not forwarding the request"
+                        );
+                        return Ok(new_blocked_response());
+                    }
+                    rules::MatchOutcome::NotMatched => continue,
                 }
             }
 

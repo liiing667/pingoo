@@ -255,16 +255,7 @@ pub async fn load_and_validate() -> Result<Config, Error> {
     let rules: Vec<Rule> = config_file
         .rules
         .into_iter()
-        .map(|(rule_name, rule_config)| {
-            Ok(Rule {
-                name: rule_name,
-                expression: rule_config
-                    .expression
-                    .map(|expression| rules::compile_expression(&expression))
-                    .map_or(Ok(None), |r| r.map(Some))?,
-                actions: rule_config.actions,
-            })
-        })
+        .map(|(rule_name, rule_config)| build_rule(rule_name, rule_config))
         .collect::<Result<_, rules::Error>>()
         .map_err(|err| Error::Config(format!("error parsing rules: {err}")))?;
 
@@ -320,6 +311,27 @@ pub async fn load_and_validate() -> Result<Config, Error> {
     };
 
     return Ok(config);
+}
+
+/// Builds a runtime [`Rule`] from its configuration.
+///
+/// Fails closed at startup: a rule without actions would match and then do
+/// nothing, which is an implicit allow and must never be configurable.
+fn build_rule(rule_name: String, rule_config: RuleConfigFile) -> Result<Rule, rules::Error> {
+    if rule_config.actions.is_empty() {
+        return Err(rules::Error::Unspecified(format!(
+            "rule {rule_name}: at least one action is required"
+        )));
+    }
+
+    return Ok(Rule {
+        name: rule_name,
+        expression: rule_config
+            .expression
+            .map(|expression| rules::compile_expression(&expression))
+            .map_or(Ok(None), |result| result.map(Some))?,
+        actions: rule_config.actions,
+    });
 }
 
 fn validate_listeners_config(
@@ -447,4 +459,44 @@ fn default_docker_socket() -> String {
 
 fn default_tls_acme_directory_url() -> String {
     return LETSENCRYPT_PRODUCTION_URL.to_string();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rule_without_actions_is_rejected_at_startup() {
+        let rule_config = RuleConfigFile {
+            expression: Some("http_request.path == \"/admin\"".to_string()),
+            actions: Vec::new(),
+        };
+
+        let err = build_rule("dangerous".to_string(), rule_config).expect_err("empty actions must be rejected");
+        assert!(matches!(err, rules::Error::Unspecified(_)));
+        assert!(err.to_string().contains("at least one action is required"));
+    }
+
+    #[test]
+    fn rule_with_actions_and_valid_expression_is_built() {
+        let rule_config = RuleConfigFile {
+            expression: Some("http_request.path == \"/admin\"".to_string()),
+            actions: vec![rules::Action::Block {}],
+        };
+
+        let rule = build_rule("block-admin".to_string(), rule_config).expect("valid rule must build");
+        assert_eq!(rule.name, "block-admin");
+        assert!(rule.expression.is_some());
+        assert_eq!(rule.actions, vec![rules::Action::Block {}]);
+    }
+
+    #[test]
+    fn rule_with_invalid_expression_is_rejected() {
+        let rule_config = RuleConfigFile {
+            expression: Some("http_request.path ==".to_string()),
+            actions: vec![rules::Action::Block {}],
+        };
+
+        assert!(build_rule("broken".to_string(), rule_config).is_err());
+    }
 }
