@@ -41,7 +41,7 @@ pub struct CaptchaManager {
 #[derive(Debug, Serialize)]
 struct CaptchaInitResponseBody {
     /// a 32-byte random challenge encoded to base64
-    pub challenge: heapless::String<44>,
+    pub challenge: heapless::String<43>,
     /// the number of leading zeroes when computing the proof-of-work
     pub difficulty: u8,
 }
@@ -192,8 +192,8 @@ impl CaptchaManager {
 
     async fn api_init(&self, client_id: &str) -> Response<BoxBody<Bytes, hyper::Error>> {
         let challenge_raw: [u8; 32] = rand::random();
-        // 32 bytes encoded to base64 = 44 bytes
-        let challenge = encode_to_base64_heapless::<44>(&challenge_raw, base64::Alphabet::UrlNoPadding);
+        // 32 bytes encoded to unpadded base64 = 43 characters
+        let challenge = encode_to_base64_heapless::<43>(&challenge_raw, base64::Alphabet::UrlNoPadding);
 
         let captcha_cookie =
             match generate_captcha_cookie(&self.signing_key, client_id, &challenge, PROOF_OF_WORK_DIFFICULTY) {
@@ -403,10 +403,25 @@ impl CaptchaManager {
             None => return new_not_found_error(),
         }
     }
+
+    /// Builds an in-memory manager with a freshly generated signing key.
+    /// Test-only: it never touches the on-disk JWKS path used in production.
+    #[cfg(test)]
+    pub fn for_tests() -> Self {
+        let key_id = Uuid::new_v7().to_string();
+        let signing_key =
+            Arc::new(jwt::Key::generate_ed25519(key_id).expect("generating an ed25519 key for tests must not fail"));
+        let verifying_keys = HashMap::from_iter([(signing_key.id.clone(), signing_key.clone())]);
+
+        CaptchaManager {
+            signing_key,
+            verifying_keys,
+        }
+    }
 }
 
 // client_id binds a JWT to a specific client of a specific site
-pub fn generate_captcha_client_id(ip: IpAddr, user_agent: &str, hostname: &str) -> heapless::String<44> {
+pub fn generate_captcha_client_id(ip: IpAddr, user_agent: &str, hostname: &str) -> heapless::String<43> {
     let mut hasher = digest::Context::new(&digest::SHA256);
     match ip {
         IpAddr::V4(ipv4_addr) => hasher.update(&ipv4_addr.octets()),
@@ -416,8 +431,8 @@ pub fn generate_captcha_client_id(ip: IpAddr, user_agent: &str, hostname: &str) 
     hasher.update(hostname.as_bytes());
     let hash: [u8; 32] = hasher.finish().as_ref().try_into().unwrap();
 
-    // 32 bytes encoded to base64 = 44 bytes
-    return encode_to_base64_heapless::<44>(&hash, base64::Alphabet::UrlNoPadding);
+    // 32 bytes encoded to unpadded base64 = 43 characters
+    return encode_to_base64_heapless::<43>(&hash, base64::Alphabet::UrlNoPadding);
 }
 
 pub fn generate_captcha_cookie(

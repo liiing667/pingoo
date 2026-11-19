@@ -18,11 +18,12 @@ use crate::{
     geoip::{self, GeoipDB, GeoipRecord},
     listeners::{GRACEFUL_SHUTDOWN_TIMEOUT, Listener, accept_tcp_connection, bind_tcp_socket},
     rules,
+    security_identity::HostIdentity,
     services::{
         HttpService,
         http_utils::{
             HOSTNAME_MAX_LENGTH, RequestContext, RequestExtensionContext, USER_AGENT_MAX_LENGTH, get_path,
-            new_blocked_response, new_not_found_error,
+            new_blocked_response, new_misdirected_request_response, new_not_found_error,
         },
     },
 };
@@ -99,6 +100,7 @@ impl Listener for HttpListener {
                         self.geoip.clone(),
                         self.captcha_manager.clone(),
                         false,
+                        None,
                         graceful_shutdown.watcher(),
                     ));
                 },
@@ -128,6 +130,7 @@ pub(super) async fn serve_http_requests<IO: hyper::rt::Read + hyper::rt::Write +
     geoip: Option<Arc<GeoipDB>>,
     captcha_manager: Arc<CaptchaManager>,
     use_tls: bool,
+    sni_identity: Option<HostIdentity>,
     graceful_shutdown_watcher: graceful::Watcher,
 ) {
     let hyper_handler = service_fn(move |mut req| {
@@ -136,9 +139,29 @@ pub(super) async fn serve_http_requests<IO: hyper::rt::Read + hyper::rt::Write +
         let lists = lists.clone();
         let geoip = geoip.clone();
         let captcha_manager = captcha_manager.clone();
+        let sni_identity = sni_identity.clone();
         async move {
             let host = get_host(&req);
             let path = get_path(&req).to_string();
+
+            // On TLS connections the SNI, the selected certificate and the HTTP Host header must
+            // describe the same security identity. A mismatch (domain fronting) or a missing SNI
+            // fails closed before any rule evaluation or backend routing happens.
+            if use_tls {
+                let host_identity = HostIdentity::parse(host.as_str()).ok();
+                if sni_identity.as_ref() != host_identity.as_ref() {
+                    return Ok(new_misdirected_request_response());
+                }
+            }
+
+            // Normalize the host used for routing and rules so TLS and plain HTTP listeners share
+            // the same identity representation. An unparseable host matches no service route.
+            let host = match HostIdentity::parse(host.as_str()) {
+                Ok(host_identity) => {
+                    heapless::String::<HOSTNAME_MAX_LENGTH>::from_str(host_identity.as_str()).unwrap_or_default()
+                }
+                Err(_) => heapless::String::new(),
+            };
 
             let geoip_record = match geoip.as_ref() {
                 Some(geoip_db) => {

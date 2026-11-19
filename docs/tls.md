@@ -20,7 +20,23 @@ pingoo.io.pem
 
 Pingoo automatically parses TLS certificates and match the hostname provided in the Server Name Indication (SNI) of the TLS protocol with the Subject Alternative Names (SANs) of the certificates to know which one to use when serving `https` / `tcp+tls` connections.
 
-If no certificate is found for the requested domain, a default self-signed certificate is used.
+Hostnames are normalized (lower-cased, port and trailing dot removed) before matching so that the
+TLS SNI, the selected certificate and the HTTP `Host` header always describe the same security
+identity. Wildcard SANs (e.g. `*.example.com`) only match a single left-most label.
+
+### Fail-closed identity enforcement
+
+Pingoo never presents a certificate for a different identity:
+
+- a TLS connection with no SNI, an invalid SNI or an SNI for which no certificate exists is
+  rejected during the handshake with a fatal TLS alert instead of falling back to another
+  certificate.
+- on HTTPS connections, an HTTP `Host` header that does not normalize to the same identity as the
+  negotiated SNI is rejected with a `421 Misdirected Request` before any rule is evaluated or any
+  backend service is reached. This blocks domain-fronting style attacks.
+
+Plain HTTP listeners are unaffected since they have no SNI; their `Host` headers keep supporting
+explicit ports.
 
 
 ## Automatic HTTPS / TLS (ACME)

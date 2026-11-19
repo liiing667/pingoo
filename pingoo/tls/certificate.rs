@@ -4,14 +4,12 @@ use std::{
 };
 
 use aws_lc_rs::digest::{SHA256, digest};
-use chrono::{DateTime, Datelike, TimeZone, Utc};
-use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
+use chrono::{DateTime, TimeZone, Utc};
 use rustls::{crypto::CryptoProvider, pki_types::CertificateDer, sign::CertifiedKey};
-use wildcard::{Wildcard, WildcardBuilder};
+use wildcard::Wildcard;
 use x509_parser::prelude::{FromDer, GeneralName, ParsedExtension, X509Certificate};
-use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::Error;
+use crate::{Error, security_identity::build_wildcard_matcher};
 
 #[derive(Clone, Debug)]
 pub struct Certificate {
@@ -31,12 +29,6 @@ pub struct CertificateMetadata {
     pub wildcard_matchers: Vec<Wildcard<'static>>,
     pub not_after: DateTime<Utc>,
     pub not_before: DateTime<Utc>,
-}
-
-#[derive(Zeroize, ZeroizeOnDrop)]
-pub struct PrivateKeyAndCertPem {
-    pub key: String,
-    pub cert: String,
 }
 
 pub fn parse_certificate_and_private_key(
@@ -117,15 +109,7 @@ fn get_certificate_metdata(cert_der: &[u8], private_key_der: &[u8]) -> Result<Ce
     let wildcard_matchers = subject_alternative_names
         .iter()
         .filter(|hostname| hostname.contains('*'))
-        .map(|hostname| {
-            let matcher = WildcardBuilder::from_owned(hostname.clone().into_bytes())
-                .case_insensitive(false)
-                .without_one_metasymbol()
-                .build()
-                .map_err(|err| Error::Tls(format!("TLS hostname {hostname} is not valid: {err}")))?;
-
-            Ok(matcher)
-        })
+        .map(|hostname| build_wildcard_matcher(hostname))
         .collect::<Result<_, Error>>()?;
 
     let hostnames = subject_alternative_names
@@ -141,52 +125,4 @@ fn get_certificate_metdata(cert_der: &[u8], private_key_der: &[u8]) -> Result<Ce
         not_after,
         not_before,
     });
-}
-
-pub fn generate_self_signed_certificates(hostnames: &[&str]) -> Result<(Certificate, PrivateKeyAndCertPem), Error> {
-    let now = Utc::now();
-    let mut cert_params: CertificateParams = Default::default();
-    // 1 year validaity by default
-    cert_params.not_before = rcgen::date_time_ymd(now.year(), now.month() as u8, now.day() as u8);
-    cert_params.not_after = rcgen::date_time_ymd(now.year() + 1, now.month() as u8, now.day() as u8);
-
-    // TODO
-    cert_params.distinguished_name = DistinguishedName::new();
-    cert_params
-        .distinguished_name
-        .push(DnType::CommonName, "Pingoo self-signed certificate");
-
-    cert_params.subject_alt_names = hostnames
-        .iter()
-        .map(|hostname| {
-            Ok(SanType::DnsName(hostname.to_string().try_into().map_err(|err| {
-                Error::Tls(format!("error converting hostname {hostname} to SAN name: {err}"))
-            })?))
-        })
-        .collect::<Result<_, Error>>()?;
-
-    let key_pair = KeyPair::generate()
-        .map_err(|err| Error::Tls(format!("error generating keypair for self-signed certificate: {err}")))?;
-
-    // it seems to be okay to sign self-signed certificate with the server's private key
-    let cert = cert_params
-        .self_signed(&key_pair)
-        .map_err(|err| Error::Tls(format!("error seigning self-signed certificate: {err}")))?;
-
-    let cert_pem = cert.pem();
-    let private_key_pem = key_pair.serialize_pem();
-
-    let certificate = parse_certificate_and_private_key(
-        cert_pem.as_bytes(),
-        private_key_pem.as_bytes(),
-        CryptoProvider::get_default().unwrap(),
-    )?;
-
-    return Ok((
-        certificate,
-        PrivateKeyAndCertPem {
-            key: private_key_pem,
-            cert: cert_pem,
-        },
-    ));
 }

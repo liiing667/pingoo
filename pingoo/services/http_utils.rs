@@ -99,6 +99,21 @@ pub fn new_blocked_response() -> Response<BoxBody<Bytes, hyper::Error>> {
         .expect("error building blocked_response");
 }
 
+/// 421 Misdirected Request: the TLS SNI identity and the HTTP Host identity do not match.
+/// Failing closed here prevents domain-fronting style attacks where a wrong certificate / backend
+/// could serve a request addressed to another hostname.
+pub fn new_misdirected_request_response() -> Response<BoxBody<Bytes, hyper::Error>> {
+    const ERROR_MESSAGE: &[u8] = b"421 Misdirected Request";
+    let res_body = Full::new(Bytes::from_static(ERROR_MESSAGE))
+        .map_err(|never| match never {})
+        .boxed();
+    return Response::builder()
+        .status(StatusCode::MISDIRECTED_REQUEST)
+        .header(header::CACHE_CONTROL, &CACHE_CONTROL_NO_CACHE)
+        .body(res_body)
+        .expect("error building new_misdirected_request_response");
+}
+
 pub fn new_method_not_allowed_error() -> Response<BoxBody<Bytes, hyper::Error>> {
     const ERROR_MESSAGE: &[u8] = b"405 Method Not Allowed";
     let res_body = Full::new(Bytes::from_static(ERROR_MESSAGE))

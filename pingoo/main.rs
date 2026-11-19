@@ -14,10 +14,14 @@ mod geoip;
 mod listeners;
 mod lists;
 mod rules;
+mod security_identity;
 mod serde_utils;
 mod service_discovery;
 mod services;
 mod tls;
+
+#[cfg(test)]
+mod test_support;
 
 pub use error::Error;
 

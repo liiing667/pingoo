@@ -11,7 +11,7 @@ use crate::{
     geoip::GeoipDB,
     listeners::{
         GRACEFUL_SHUTDOWN_TIMEOUT, Listener, accept_tcp_connection, accept_tls_connection, bind_tcp_socket,
-        http_listener::serve_http_requests,
+        http_listener::serve_http_requests, validated_sni_identity,
     },
     rules::Rule,
     services::HttpService,
@@ -94,6 +94,10 @@ impl Listener for HttpsListener {
                             _ => return,
                         };
 
+                        // the TLS layer already failed closed on unknown SNIs; surface the
+                        // negotiated identity so the HTTP layer can verify the Host header.
+                        let sni_identity = validated_sni_identity(&tls_stream);
+
                         serve_http_requests(
                             TokioIo::new(tls_stream),
                             self.services.clone(),
@@ -105,6 +109,7 @@ impl Listener for HttpsListener {
                             self.geoip.clone(),
                             self.captcha_manager.clone(),
                             true,
+                            sni_identity,
                             graceful_shutdown.watcher(),
                         )
                     });

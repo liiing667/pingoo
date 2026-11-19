@@ -8,10 +8,11 @@ use rustls::{ServerConfig, server::Acceptor};
 use socket2::{Domain, Socket, Type};
 use tokio::{io::AsyncWriteExt, net::TcpStream, sync::watch, time};
 use tokio_rustls::{LazyConfigAcceptor, server::TlsStream};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{
     Error,
+    security_identity::HostIdentity,
     tls::{TlsManager, acme::is_tls_alpn_challenge},
 };
 
@@ -19,6 +20,9 @@ mod http_listener;
 mod https_listener;
 mod tcp_listener;
 mod tcp_tls_listener;
+
+#[cfg(test)]
+mod http_identity_tests;
 
 pub use http_listener::HttpListener;
 pub use https_listener::HttpsListener;
@@ -191,4 +195,21 @@ async fn accept_tls_connection<IO: Unpin + tokio::io::AsyncRead + tokio::io::Asy
     debug!(listener = listener_name, client = ?client_socket_addr, "TLS connection accepted");
 
     return Ok(Some(tcp_stream));
+}
+
+/// Extracts and validates the SNI hostname negotiated for an established TLS stream.
+///
+/// The certificate resolver already fails closed for unknown SNIs, so a connection reaching
+/// application data always carries an SNI matching one of the configured certificates. Returning
+/// the normalized identity lets the HTTP layer verify that the Host header shares that identity.
+pub fn validated_sni_identity<IO>(tls_stream: &TlsStream<IO>) -> Option<HostIdentity> {
+    let raw_sni = tls_stream.get_ref().1.server_name()?;
+
+    match HostIdentity::parse(raw_sni) {
+        Ok(host_identity) => Some(host_identity),
+        Err(err) => {
+            warn!("tls: accepted connection with unparseable SNI {raw_sni:?}: {err}");
+            None
+        }
+    }
 }
